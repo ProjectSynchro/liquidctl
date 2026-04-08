@@ -59,6 +59,13 @@ _DATA_TYPE_HW_CURVE_PERCENT = (0x05, 0x00)
 _FAN_MODE_FIXED_PERCENT = 0x00
 _FAN_MODE_CURVE_PERCENT = 0x02
 
+# RGB port mode values reported by the LED count endpoint.  The 4-pin
+# per-fan headers always report CONNECTED or DISCONNECTED; the Commander
+# Core XT's 3-pin RGB(C) header always reads back as 0x0000 even when
+# iCUE has configured it, so we treat that as N/A rather than guessing.
+_RGB_MODE_CONNECTED = 0x02
+_RGB_MODE_DISCONNECTED = 0x03
+
 class CommanderCore(UsbHidDriver):
     """Corsair Commander Core"""
 
@@ -101,19 +108,21 @@ class CommanderCore(UsbHidDriver):
         with self._wake_device_context():
             status = [('Firmware version', '{}.{}.{}'.format(*fw_version), '')]
 
-            # Get LEDs per fan
+            # Get LEDs per fan; index 0 is the EXT/AIO port on the Core/ST
+            # and the 3-pin RGB(C) external strip header on the XT.  Indices
+            # 1..6 are the per-fan RGB headers and align with fan numbering.
             res = self._read_data(_MODE_LED_COUNT, _DATA_TYPE_LED_COUNT)
             num_devices = res[0]
             led_data = res[1:1 + num_devices * 4]
             for i in range(0, num_devices):
-                connected = u16le_from(led_data, offset=i * 4) == 2
+                mode = u16le_from(led_data, offset=i * 4)
                 num_leds = u16le_from(led_data, offset=i * 4 + 2)
-                if self._has_pump:
-                    label = 'AIO LED count' if i == 0 else f'RGB port {i} LED count'
+                if i == 0:
+                    label = 'AIO LED count' if self._has_pump else 'External LED count'
                 else:
-                    label = f'RGB port {i+1} LED count'
+                    label = f'RGB port {i} LED count'
 
-                status += [(label, num_leds if connected else None, '')]
+                status += [(label, num_leds if mode == _RGB_MODE_CONNECTED else None, '')]
 
             # Get what fans are connected
             res = self._read_data(_MODE_CONNECTED_SPEEDS, _DATA_TYPE_CONNECTED_SPEEDS)

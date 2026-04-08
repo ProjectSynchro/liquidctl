@@ -87,8 +87,13 @@ class MockCommanderCoreDevice:
                         data.append(len(self.led_counts))
                         for i in self.led_counts:
                             if i is None:
-                                data.extend(int_to_le(3)+int_to_le(0))
+                                # disconnected
+                                data.extend(int_to_le(3) + int_to_le(0))
+                            elif i == 'not_configured':
+                                # XT external 3-pin RGB(C), no auto-detect
+                                data.extend(int_to_le(0) + int_to_le(0))
                             else:
+                                # connected, i is the LED count
                                 data.extend(int_to_le(2))
                                 data.extend(int_to_le(i))
                     elif mode[0] == 0x21:  # Get temperatures
@@ -450,15 +455,33 @@ def test_parse_channels_error_commander_core():
 
 
 def test_initialize_commander_core_xt(commander_core_xt_device):
+    # real Core XT hardware returns 7 LED ports (the external 3-pin RGB(C)
+    # strip header at index 0 plus 6 per-fan RGB headers) but only 6 speed
+    # ports; channel 0 reports mode 0x0000 even after iCUE has set the LED
+    # count, so the driver surfaces it as N/A like an empty per-fan header
     commander_core_xt_device.device.firmware_version = (0x01, 0x04, 0x3e)
     commander_core_xt_device.device.speeds = (733, 709, 696, None, None, None)
-    commander_core_xt_device.device.led_counts = (None, 8, 8, 8, None, None, None)
+    commander_core_xt_device.device.led_counts = ('not_configured', 8, 8, 8, None, None, None)
     commander_core_xt_device.device.temperatures = (None, 32.1)
     res = commander_core_xt_device.initialize()
 
+    # 1 firmware + 7 LED counts + 6 fan ports + 2 temp sensors
+    assert len(res) == 16
     assert res[0][1] == '1.4.62'
 
-    # speed devices connected: indices 8..13 are the 6 fan ports
+    assert res[1][0] == 'External LED count'
+    assert res[1][1] is None
+    assert res[2][0] == 'RGB port 1 LED count'
+    assert res[2][1] == 8
+    assert res[3][0] == 'RGB port 2 LED count'
+    assert res[3][1] == 8
+    assert res[4][0] == 'RGB port 3 LED count'
+    assert res[4][1] == 8
+    assert res[5][0] == 'RGB port 4 LED count'
+    assert res[5][1] is None
+    assert res[6][0] == 'RGB port 5 LED count'
+    assert res[7][0] == 'RGB port 6 LED count'
+
     assert res[8][0] == 'Fan port 1 connected'
     assert res[8][1]
     assert res[9][1]
@@ -467,11 +490,46 @@ def test_initialize_commander_core_xt(commander_core_xt_device):
     assert not res[12][1]
     assert not res[13][1]
 
-    # temperature sensors
+    assert res[14][0] == 'Temperature sensor 1'
     assert not res[14][1]
+    assert res[15][0] == 'Temperature sensor 2'
     assert res[15][1]
 
     assert not commander_core_xt_device.device._awake
+
+
+def test_initialize_commander_core_xt_independent_rgb_and_fan_headers(commander_core_xt_device):
+    # the 6 PWM headers and 6 Corsair RGB headers on the XT are physically
+    # independent connectors, so any combination is valid; here all 6 RGB
+    # rings are populated but only 3 fans report a tach signal
+    commander_core_xt_device.device.firmware_version = (0x01, 0x04, 0x3e)
+    commander_core_xt_device.device.speeds = (None, None, None, 706, 713, 716)
+    commander_core_xt_device.device.led_counts = ('not_configured', 8, 8, 8, 8, 8, 8)
+    commander_core_xt_device.device.temperatures = (None, None)
+    res = commander_core_xt_device.initialize()
+
+    assert res[1][0] == 'External LED count'
+    assert res[1][1] is None
+    for rgb_idx in range(2, 8):
+        assert res[rgb_idx][1] == 8, (
+            f'expected 8 LEDs on {res[rgb_idx][0]}, got {res[rgb_idx][1]}'
+        )
+
+    assert not res[8][1] and not res[9][1] and not res[10][1]
+    assert res[11][1] and res[12][1] and res[13][1]
+
+
+def test_initialize_commander_core_aio_uses_connected_mode(commander_core_device):
+    # the Capellix pump auto-identifies and reports a real LED count;
+    # the AIO LED count must come through as an integer
+    commander_core_device.device.firmware_version = (0x02, 0x06, 0xc9)
+    commander_core_device.device.led_counts = (29, 8, 8, None, None, None, None)
+    commander_core_device.device.speeds = (2300, 800, 800, None, None, None, None)
+    commander_core_device.device.temperatures = (35.8, None)
+    res = commander_core_device.initialize()
+
+    assert res[1][0] == 'AIO LED count'
+    assert res[1][1] == 29
 
 
 def test_commander_core_xt_skips_continuation_reads(commander_core_xt_device):
