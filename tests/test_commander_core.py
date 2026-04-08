@@ -59,6 +59,11 @@ class MockCommanderCoreDevice:
         # if set, the next .write() call raises this exception.  used to
         # exercise the wake/sleep cleanup paths in the driver.
         self.raise_on_next_write = None
+        # if set, override the count byte returned by HW_FIXED_PERCENT
+        # reads.  the data area still contains all configured fan duties;
+        # only the count byte is replaced.  mimics the iCUE-induced state
+        # observed on real Commander Core XT hardware.
+        self.fixed_speeds_stale_count = None
 
     def read(self, length):
         data = bytearray([0x00, self._last_write[2], 0x00])
@@ -125,7 +130,10 @@ class MockCommanderCoreDevice:
                             data.append(i)
                     elif mode[0] == 0x61:
                         data.extend([0x04, 0x00])
-                        data.append(len(self.fixed_speeds))
+                        if self.fixed_speeds_stale_count is not None:
+                            data.append(self.fixed_speeds_stale_count)
+                        else:
+                            data.append(len(self.fixed_speeds))
                         for i in self.fixed_speeds:
                             data.extend(int_to_le(i))
                     elif mode[0] == 0x62:
@@ -725,6 +733,42 @@ def test_read_data_accepts_lying_data_type_zero(commander_core_xt_device):
     commander_core_xt_device.device.speeds_mode = (0, 0, 0, 0, 0, 0)
     commander_core_xt_device.device.fixed_speeds = (40, 40, 40, 40, 40, 40)
     commander_core_xt_device.device.lie_data_type_for = {(0x61, 0x6d): (0x00, 0x00)}
+
+    commander_core_xt_device.set_fixed_speed('fan4', 75)
+
+    assert commander_core_xt_device.device.fixed_speeds == (40, 40, 40, 75, 40, 40)
+    assert not commander_core_xt_device.device._awake
+
+
+def test_set_fixed_speed_ignores_stale_hw_fixed_count(commander_core_xt_device):
+    # observed in the wild on a Core XT: HW_FIXED_PERCENT can come back
+    # with a count byte of 2 even though the device has 6 fans, after
+    # iCUE has only configured the fixed-mode table for the first two
+    # fans.  the data area still contains all six duties.  the driver
+    # must ignore the stale count and write back all six entries with
+    # the requested update applied to every channel
+    commander_core_xt_device.device.firmware_version = (0x01, 0x04, 0x3e)
+    commander_core_xt_device.device.speeds_mode = (0, 0, 0, 0, 0, 0)
+    commander_core_xt_device.device.fixed_speeds = (40, 40, 40, 40, 40, 40)
+    commander_core_xt_device.device.fixed_speeds_stale_count = 2
+
+    commander_core_xt_device.set_fixed_speed('fans', 28)
+
+    # the connected count remains 6 (driver re-asserts it on write) and
+    # every fan picks up the new duty, including the ones beyond the
+    # stale count byte
+    assert commander_core_xt_device.device.fixed_speeds == (28, 28, 28, 28, 28, 28)
+    assert not commander_core_xt_device.device._awake
+
+
+def test_set_fixed_speed_one_channel_ignores_stale_hw_fixed_count(commander_core_xt_device):
+    # same setup as above but updating a single high-numbered channel
+    # (fan 4 == channel 3) to make sure the bug fix isn't masked by the
+    # broadcast update path
+    commander_core_xt_device.device.firmware_version = (0x01, 0x04, 0x3e)
+    commander_core_xt_device.device.speeds_mode = (0, 0, 0, 0, 0, 0)
+    commander_core_xt_device.device.fixed_speeds = (40, 40, 40, 40, 40, 40)
+    commander_core_xt_device.device.fixed_speeds_stale_count = 2
 
     commander_core_xt_device.set_fixed_speed('fan4', 75)
 

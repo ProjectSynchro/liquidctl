@@ -12,7 +12,7 @@ import logging
 from contextlib import contextmanager
 
 from liquidctl.driver.usb import UsbHidDriver
-from liquidctl.error import ExpectationNotMet, NotSupportedByDriver, NotSupportedByDevice
+from liquidctl.error import NotSupportedByDriver, NotSupportedByDevice
 from liquidctl.util import clamp, u16le_from
 
 _LOGGER = logging.getLogger(__name__)
@@ -195,13 +195,21 @@ class CommanderCore(UsbHidDriver):
             self._write_data(_MODE_HW_SPEED_MODE, _DATA_TYPE_HW_SPEED_MODE, data)
 
 
-            # Read in data and split by device
+            # Read in data and split by device.  HW_CURVE_PERCENT sometimes
+            # returns a stale count byte after iCUE has only configured a
+            # subset of fans for hardware control; trust the count from
+            # HW_SPEED_MODE and fall back to an empty curve placeholder
+            # for any device whose entry is missing from the response.
             res = self._read_data(_MODE_HW_CURVE_PERCENT, _DATA_TYPE_HW_CURVE_PERCENT)
-            device_count = res[0]
             data_by_device = []
 
             i = 1
             for _ in range(0, device_count):
+                if i + 2 > len(res):
+                    # ran past the end of the response: use an empty curve
+                    # placeholder (sensor 0, zero points)
+                    data_by_device.append(b'\x00\x00')
+                    continue
                 count = res[i+1]
                 start = i
                 end = i + 4 * count + 2
@@ -242,14 +250,25 @@ class CommanderCore(UsbHidDriver):
                 data[chan + 1] = _FAN_MODE_FIXED_PERCENT
             self._write_data(_MODE_HW_SPEED_MODE, _DATA_TYPE_HW_SPEED_MODE, data)
 
-            # Set speed
+            # Set speed.  HW_FIXED_PERCENT sometimes comes back with a stale
+            # count byte after iCUE has only configured a subset of fans for
+            # fixed mode (the data area still holds all fan duties).  Trust
+            # the device count from HW_SPEED_MODE and copy the existing
+            # duties out of the response by position rather than by count.
             res = self._read_data(_MODE_HW_FIXED_PERCENT, _DATA_TYPE_HW_FIXED_PERCENT)
-            device_count = res[0]
-            data = bytearray(res[0:device_count * 2 + 1])
+            if len(res) < 1 + device_count * 2:
+                raise ExpectationNotMet(
+                    f'HW_FIXED_PERCENT response is {len(res)} bytes, '
+                    f'expected at least {1 + device_count * 2}')
+            data = bytearray(device_count * 2 + 1)
+            data[0] = device_count
+            for i in range(device_count):
+                offset = 1 + i * 2
+                data[offset:offset + 2] = bytes(res[offset:offset + 2])
             duty_le = int.to_bytes(clamp(duty, 0, 100), length=2, byteorder="little", signed=False)
             for chan in channels:
-                i = chan * 2 + 1
-                data[i: i + 2] = duty_le  # Update the device speed
+                offset = 1 + chan * 2
+                data[offset:offset + 2] = duty_le  # Update the device speed
             self._write_data(_MODE_HW_FIXED_PERCENT, _DATA_TYPE_HW_FIXED_PERCENT, data)
 
     @classmethod
