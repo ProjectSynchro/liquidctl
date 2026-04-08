@@ -17,8 +17,13 @@ from liquidctl.util import clamp, u16le_from
 
 _LOGGER = logging.getLogger(__name__)
 
-_REPORT_LENGTH = 96
-_RESPONSE_LENGTH = 96
+# Wire packet length (without the leading HID report ID byte); each variant
+# advertises a different HID report size and using the wrong one truncates
+# reads and corrupts device state.
+_PACKET_LENGTH_CORE_V1 = 1024
+_PACKET_LENGTH_CORE_V2 = 96
+_PACKET_LENGTH_CORE_XT = 384
+_PACKET_LENGTH_CORE_ST = 64
 
 _INTERFACE_NUMBER = 0
 
@@ -59,23 +64,41 @@ class CommanderCore(UsbHidDriver):
 
     # For a non-exhaustive list of issues, see: #520, #583, #598, #623, #705
     _MATCHES = [
-        (0x1b1c, 0x0c1c, 'Corsair Commander Core (broken)', {"has_pump": True}),
-        (0x1b1c, 0x0c2a, 'Corsair Commander Core XT (broken)', {"has_pump": False}),
-        (0x1b1c, 0x0c32, 'Corsair Commander ST (broken)', {"has_pump": True}),
+        (0x1b1c, 0x0c1c, 'Corsair Commander Core (broken)',
+            {"has_pump": True, "packet_length": _PACKET_LENGTH_CORE_V2}),
+        (0x1b1c, 0x0c2a, 'Corsair Commander Core XT (broken)',
+            {"has_pump": False, "packet_length": _PACKET_LENGTH_CORE_XT}),
+        (0x1b1c, 0x0c32, 'Corsair Commander ST (broken)',
+            {"has_pump": True, "packet_length": _PACKET_LENGTH_CORE_ST}),
     ]
 
-    def __init__(self, device, description, has_pump, **kwargs):
+    def __init__(self, device, description, has_pump, packet_length=_PACKET_LENGTH_CORE_V2, **kwargs):
         super().__init__(device, description, **kwargs)
         self._has_pump = has_pump
+        # may be raised to _PACKET_LENGTH_CORE_V1 in initialize() if this
+        # Commander Core turns out to be running firmware v1.x.x
+        self._packet_length = packet_length
 
     def initialize(self, **kwargs):
         """Initialize the device and get the fan modes."""
 
-        with self._wake_device_context():
-            # Get Firmware
-            res = self._send_command(_CMD_GET_FIRMWARE)
-            fw_version = (res[3], res[4], res[5])
+        # the firmware version query does not require a prior wake, and we
+        # need the major version up front to pick the right packet length
+        res = self._send_command(_CMD_GET_FIRMWARE)
+        fw_version = (res[3], res[4], res[5])
 
+        # the original Commander Core uses 1024-byte HID reports under
+        # firmware v1.x.x and 96-byte reports under v2.x.x; the Core XT and
+        # Commander ST always use the fixed sizes set at construction time
+        if (self.device.product_id == 0x0c1c
+                and fw_version[0] == 1
+                and self._packet_length != _PACKET_LENGTH_CORE_V1):
+            _LOGGER.debug('Commander Core firmware v1 detected, '
+                          'switching to %d byte packets',
+                          _PACKET_LENGTH_CORE_V1)
+            self._packet_length = _PACKET_LENGTH_CORE_V1
+
+        with self._wake_device_context():
             status = [('Firmware version', '{}.{}.{}'.format(*fw_version), '')]
 
             # Get LEDs per fan
@@ -257,20 +280,36 @@ class CommanderCore(UsbHidDriver):
 
         return temps
 
+    # Largest payload we may need to retrieve; bounded by the hardware speed
+    # curve table at 7 ports * 30 bytes + 1 count byte = 211 bytes.
+    _MAX_PAYLOAD_LEN = 256
+
     def _read_data(self, mode, data_type):
         self._send_command(_CMD_OPEN_ENDPOINT, mode)
         raw_data = self._send_command(_CMD_READ_INITIAL)
-        more_raw_data = self._send_command(_CMD_READ_MORE)
-        final_raw_data = self._send_command(_CMD_READ_FINAL)
-        self._send_command(_CMD_CLOSE_ENDPOINT)
+
         if tuple(raw_data[3:5]) != data_type:
+            # close the endpoint before raising or the device gets stuck
+            self._send_command(_CMD_CLOSE_ENDPOINT)
             raise ExpectationNotMet('device returned incorrect data type')
 
-        return raw_data[5:] + more_raw_data[3:] + final_raw_data[3:]
+        # only chain Read More / Read Final when a single packet can't hold
+        # the largest payload we might ask for; sending them on the XT (or
+        # Core firmware v1) leaves the device in an undefined state (#598)
+        result = bytearray(raw_data[5:])
+        initial_capacity = self._packet_length - 5
+        if initial_capacity < self._MAX_PAYLOAD_LEN:
+            more_raw_data = self._send_command(_CMD_READ_MORE)
+            result.extend(more_raw_data[3:])
+            final_raw_data = self._send_command(_CMD_READ_FINAL)
+            result.extend(final_raw_data[3:])
+
+        self._send_command(_CMD_CLOSE_ENDPOINT)
+        return bytes(result)
 
     def _send_command(self, command, data=()):
         # self.device.write expects buf[0] to be the report number or 0 if not used
-        buf = bytearray(_REPORT_LENGTH + 1)
+        buf = bytearray(self._packet_length + 1)
 
         # buf[1] when going out is always 08
         buf[1] = 0x08
@@ -287,9 +326,9 @@ class CommanderCore(UsbHidDriver):
         self.device.clear_enqueued_reports()
         self.device.write(buf)
 
-        res = self.device.read(_RESPONSE_LENGTH)
+        res = self.device.read(self._packet_length)
         while res[0] != 0x00:
-            res = self.device.read(_RESPONSE_LENGTH)
+            res = self.device.read(self._packet_length)
         buf = bytes(res)
         assert buf[1] == command[0], 'response does not match command'
         return buf
@@ -313,7 +352,7 @@ class CommanderCore(UsbHidDriver):
         while (data_start_index < data_len):
             if (data_start_index == 0):
                 # First 9 bytes are in use
-                packet_data_len = _REPORT_LENGTH - 9
+                packet_data_len = self._packet_length - 9
 
                 if (data_len < packet_data_len):
                     packet_data_len = data_len
@@ -332,7 +371,7 @@ class CommanderCore(UsbHidDriver):
                 data_start_index += packet_data_len
             else:
                 # First 3 bytes are in use
-                packet_data_len = _REPORT_LENGTH - 3
+                packet_data_len = self._packet_length - 3
                 if data_len - data_start_index < packet_data_len:
                     packet_data_len = data_len - data_start_index
 

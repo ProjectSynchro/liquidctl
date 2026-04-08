@@ -12,15 +12,19 @@ def int_to_le(num, length=2, byteorder='little', signed=False):
 
 
 class MockCommanderCoreDevice:
-    def __init__(self):
+    def __init__(self, product_id=0x0c1c, packet_length=96):
         self.vendor_id = 0x1b1c
-        self.product_id = 0x0c1c
+        self.product_id = product_id
         self.address = 'addr'
         self.path = b'path'
         self.release_number = None
         self.serial_number = None
         self.bus = None
         self.port = None
+
+        # wire packet length (without the HID report ID); reads/writes
+        # mismatching this size are rejected to mimic hidapi behavior
+        self._packet_length = packet_length
 
         self.open = noop
         self.close = noop
@@ -127,10 +131,16 @@ class MockCommanderCoreDevice:
 
 
 
-        return list(data)[:length]
+        # cap reads at the device's report size, like hidapi does
+        return list(data)[:min(length, self._packet_length)]
 
     def write(self, data):
         data = bytes(data)  # ensure data is convertible to bytes
+        # reject mismatched writes to catch packet length bugs in the driver
+        if len(data) != self._packet_length + 1:
+            raise ValueError(
+                f'host->device packet length {len(data)} does not match '
+                f'device report size {self._packet_length + 1}')
         self._last_write = data
         if data[0] != 0x00 or data[1] != 0x08:
             raise ValueError('Start of packets going out should be 00:08')
@@ -199,7 +209,7 @@ def commander_core_device():
 
 
 def test_initialize_commander_core(commander_core_device):
-    commander_core_device.device.firmware_version = (0x01, 0x02, 0x21)
+    commander_core_device.device.firmware_version = (0x02, 0x06, 0xc9)
     commander_core_device.device.speeds = (None, 104, None, None, None, None, 918)
     commander_core_device.device.led_counts = (27, None, 1, 2, 4, 8, 16)
     commander_core_device.device.temperatures = (None, 45.6)
@@ -207,7 +217,7 @@ def test_initialize_commander_core(commander_core_device):
 
     assert len(res) == 17
 
-    assert res[0][1] == '1.2.33'  # Firmware
+    assert res[0][1] == '2.6.201'  # Firmware
 
     # LED counts
     assert res[1][1] == 27
