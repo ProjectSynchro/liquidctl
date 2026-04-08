@@ -32,6 +32,47 @@ Corsair Commander Core
 └── Temperature sensor 1             No
 ```
 
+The Commander Core XT has six 4-pin PWM fan headers, six 4-pin Corsair RGB
+headers, and one 3-pin Corsair RGB header (the `RGB(C)` external strip
+header used for RGB strips and Hydro X loops).  The PWM headers and the
+4-pin RGB headers are physically independent connectors, so a fan with
+separate PWM and RGB cables plugs into one of each, and either side can be
+populated without the other.  As a result, the Commander Core XT exposes
+seven LED ports but only six fan ports:
+
+```
+# liquidctl initialize
+Corsair Commander Core XT
+├── Firmware version             1.4.62
+├── External LED count              N/A
+├── RGB port 1 LED count              8
+├── RGB port 2 LED count              8
+├── RGB port 3 LED count              8
+├── RGB port 4 LED count            N/A
+├── RGB port 5 LED count            N/A
+├── RGB port 6 LED count            N/A
+├── Fan port 1 connected            Yes
+├── Fan port 2 connected            Yes
+├── Fan port 3 connected            Yes
+├── Fan port 4 connected             No
+├── Fan port 5 connected             No
+├── Fan port 6 connected             No
+├── Temperature sensor 1             No
+└── Temperature sensor 2             No
+```
+
+`External LED count` corresponds to the 3-pin RGB(C) header.  The 4-pin
+Corsair RGB headers auto-identify the connected fan model, but the 3-pin
+header is not surfaced through this endpoint regardless of whether iCUE
+has assigned it any LEDs, so the count is always reported as N/A.
+
+`RGB port N LED count` reports what the device sees on the Nth 4-pin RGB
+header, and `Fan port N connected` reports whether the Nth PWM header has a
+tach signal.  Because the headers are independent, asymmetric setups are
+normal: for example, six populated RGB rings with only three PWM signals
+when Corsair lighting accessories are wired into RGB headers without
+occupying a PWM port.
+
 ## Retrieving the pump speed, fan speeds, and temperatures
 
 The Commander Core and ST currently can retrieve the pump speed, fan speeds, temperature of the water, and
