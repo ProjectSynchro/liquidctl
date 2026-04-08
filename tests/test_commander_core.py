@@ -32,6 +32,11 @@ class MockCommanderCoreDevice:
 
         self._read = deque()
         self.sent = list()
+        # opcodes (data[2]) seen by .write(), in order
+        self.command_log = []
+        # subcommand byte (data[4]) for every Read command: 0x01 Initial,
+        # 0x02 More, 0x03 Final
+        self.read_subcommand_log = []
 
         self._last_write = bytes()
         self._modes = {}
@@ -53,6 +58,12 @@ class MockCommanderCoreDevice:
         if self._last_write[2] == 0x02:  # Firmware version
             for i in range(0, 3):
                 data.append(self.firmware_version[i])
+            # mimic real Commander Core hardware: firmware v1.x.x bumps the
+            # report size from 96 to 1024 bytes for all subsequent commands
+            if (self.product_id == 0x0c1c
+                    and self.firmware_version[0] == 1
+                    and self._packet_length == 96):
+                self._packet_length = 1024
         if self._awake:
             if self._last_write[2] == 0x08 or self._last_write[2] == 0x09:  # Get data
                 channel = self._last_write[3]
@@ -144,6 +155,9 @@ class MockCommanderCoreDevice:
         self._last_write = data
         if data[0] != 0x00 or data[1] != 0x08:
             raise ValueError('Start of packets going out should be 00:08')
+        self.command_log.append(data[2])
+        if data[2] == 0x08:
+            self.read_subcommand_log.append(data[4])
         if data[2] == 0x0d:
             channel = data[3]
             if  self._modes.get(channel) is None:
@@ -204,6 +218,22 @@ class MockCommanderCoreDevice:
 def commander_core_device():
     device = MockCommanderCoreDevice()
     core = CommanderCore(device, 'Corsair Commander Core', True)
+    core.connect()
+    return core
+
+
+@pytest.fixture
+def commander_core_xt_device():
+    device = MockCommanderCoreDevice(product_id=0x0c2a, packet_length=384)
+    core = CommanderCore(device, 'Corsair Commander Core XT', False, packet_length=384)
+    core.connect()
+    return core
+
+
+@pytest.fixture
+def commander_st_device():
+    device = MockCommanderCoreDevice(product_id=0x0c32, packet_length=64)
+    core = CommanderCore(device, 'Corsair Commander ST', True, packet_length=64)
     core.connect()
     return core
 
@@ -412,3 +442,193 @@ def test_parse_channels_error_commander_core():
     core = CommanderCore(MockCommanderCoreDevice(), 'Corsair Commander Core', True)
     with pytest.raises(ValueError):
         core._parse_channels('fan')
+
+
+# Commander Core XT (PID 0x0c2a) tests.  The Core XT advertises 384-byte HID
+# reports; using the wrong size locked it up and required an iCUE reset
+# (#520, #583, #598, #623, #705).
+
+
+def test_initialize_commander_core_xt(commander_core_xt_device):
+    commander_core_xt_device.device.firmware_version = (0x01, 0x04, 0x3e)
+    commander_core_xt_device.device.speeds = (733, 709, 696, None, None, None)
+    commander_core_xt_device.device.led_counts = (None, 8, 8, 8, None, None, None)
+    commander_core_xt_device.device.temperatures = (None, 32.1)
+    res = commander_core_xt_device.initialize()
+
+    assert res[0][1] == '1.4.62'
+
+    # speed devices connected: indices 8..13 are the 6 fan ports
+    assert res[8][0] == 'Fan port 1 connected'
+    assert res[8][1]
+    assert res[9][1]
+    assert res[10][1]
+    assert not res[11][1]
+    assert not res[12][1]
+    assert not res[13][1]
+
+    # temperature sensors
+    assert not res[14][1]
+    assert res[15][1]
+
+    assert not commander_core_xt_device.device._awake
+
+
+def test_commander_core_xt_skips_continuation_reads(commander_core_xt_device):
+    # the XT fits any payload in a single 384-byte report; sending Read More
+    # or Read Final on the XT leaves it in an undefined state
+    commander_core_xt_device.device.firmware_version = (0x01, 0x04, 0x3e)
+    commander_core_xt_device.device.speeds = (920, 904, None, None, None, None)
+    commander_core_xt_device.device.led_counts = (8, 8, None, None, None, None)
+    commander_core_xt_device.device.temperatures = (None, 32.1)
+    commander_core_xt_device.initialize()
+
+    subcommands = commander_core_xt_device.device.read_subcommand_log
+    assert subcommands, 'driver did not issue any read commands'
+    assert all(sub == 0x01 for sub in subcommands), (
+        f'unexpected continuation read on Commander Core XT: {subcommands}'
+    )
+
+
+def test_commander_core_v2_still_uses_continuation_reads(commander_core_device):
+    # the 96-byte v2 path still needs Read More / Read Final for the curve
+    # table; pin that to avoid accidentally regressing the original Core
+    commander_core_device.device.firmware_version = (0x02, 0x06, 0xc9)
+    commander_core_device.device.speeds = (None, 104, None, None, None, None, 918)
+    commander_core_device.device.led_counts = (27, None, 1, 2, 4, 8, 16)
+    commander_core_device.device.temperatures = (None, 45.6)
+    commander_core_device.initialize()
+
+    subcommands = commander_core_device.device.read_subcommand_log
+    assert 0x01 in subcommands
+    assert 0x02 in subcommands
+    assert 0x03 in subcommands
+
+
+def test_commander_core_xt_uses_correct_packet_length(commander_core_xt_device):
+    # the mock raises ValueError if any write uses the wrong packet length
+    commander_core_xt_device.device.firmware_version = (0x01, 0x04, 0x3e)
+    commander_core_xt_device.device.speeds = (920, 904, None, None, None, None)
+    commander_core_xt_device.device.led_counts = (8, 8, None, None, None, None)
+    commander_core_xt_device.device.temperatures = (None, 32.1)
+    commander_core_xt_device.initialize()
+
+
+def test_set_fixed_speed_commander_core_xt(commander_core_xt_device):
+    # the XT has no AIO/pump channel, so fan1 maps to controller channel 0
+    commander_core_xt_device.device.speeds_mode = (1, 2, 3, 4, 5, 6)
+    commander_core_xt_device.device.fixed_speeds = (8, 9, 10, 11, 12, 13)
+    commander_core_xt_device.device.firmware_version = (0x01, 0x04, 0x3e)
+
+    commander_core_xt_device.set_fixed_speed('fan1', 73)
+
+    assert commander_core_xt_device.device.speeds_mode == (0, 2, 3, 4, 5, 6)
+    assert commander_core_xt_device.device.fixed_speeds == (73, 9, 10, 11, 12, 13)
+    assert not commander_core_xt_device.device._awake
+
+
+def test_set_fixed_speed_fans_commander_core_xt(commander_core_xt_device):
+    commander_core_xt_device.device.speeds_mode = (1, 2, 3, 4, 5, 6)
+    commander_core_xt_device.device.fixed_speeds = (8, 9, 10, 11, 12, 13)
+    commander_core_xt_device.device.firmware_version = (0x01, 0x04, 0x3e)
+
+    commander_core_xt_device.set_fixed_speed('fans', 50)
+
+    assert commander_core_xt_device.device.speeds_mode == (0, 0, 0, 0, 0, 0)
+    assert commander_core_xt_device.device.fixed_speeds == (50, 50, 50, 50, 50, 50)
+    assert not commander_core_xt_device.device._awake
+
+
+# Commander ST (PID 0x0c32) tests.  The ST uses 64-byte HID reports;
+# the old hardcoded 96-byte reads overran the response and raised
+# IndexError (#705).
+
+
+def test_initialize_commander_st(commander_st_device):
+    commander_st_device.device.firmware_version = (0x02, 0x06, 0xc9)
+    commander_st_device.device.speeds = (2300, 800, 800, None, None, None, None)
+    commander_st_device.device.led_counts = (29, 8, 8, None, None, None, None)
+    commander_st_device.device.temperatures = (35.8, None)
+    res = commander_st_device.initialize()
+
+    assert len(res) == 17
+    assert res[0][1] == '2.6.201'
+
+    assert res[1][1] == 29       # AIO LED count
+    assert res[8][1]              # AIO connected
+    assert res[15][1]             # Water temperature sensor connected
+    assert not res[16][1]         # probe sensor disconnected
+
+    assert not commander_st_device.device._awake
+
+
+def test_set_fixed_speed_commander_st(commander_st_device):
+    # regression for #705: 96/64-byte packet mismatch raised IndexError
+    commander_st_device.device.firmware_version = (0x02, 0x06, 0xc9)
+    commander_st_device.device.speeds_mode = (1, 2, 3, 4, 5, 6, 7)
+    commander_st_device.device.fixed_speeds = (8, 9, 10, 11, 12, 13, 14)
+
+    commander_st_device.set_fixed_speed('fan2', 95)
+
+    assert commander_st_device.device.speeds_mode == (1, 2, 0, 4, 5, 6, 7)
+    assert commander_st_device.device.fixed_speeds == (8, 9, 95, 11, 12, 13, 14)
+    assert not commander_st_device.device._awake
+
+
+def test_commander_st_uses_correct_packet_length(commander_st_device):
+    # the mock raises ValueError if any write uses the wrong packet length
+    commander_st_device.device.firmware_version = (0x02, 0x06, 0xc9)
+    commander_st_device.device.speeds = (2300, 800, 800, None, None, None, None)
+    commander_st_device.device.led_counts = (29, 8, 8, None, None, None, None)
+    commander_st_device.device.temperatures = (35.8, None)
+    commander_st_device.initialize()
+
+
+# Commander Core firmware v1 detection.  Firmware v1.x.x uses 1024-byte HID
+# reports instead of the 96-byte reports used by v2.x.x; the driver detects
+# this on the fly during initialize() and the mock auto-bumps its packet
+# length to mirror real hardware behavior.
+
+
+def test_initialize_commander_core_v1_firmware(commander_core_device):
+    # the full v1 path: firmware query goes out at 96 bytes, the response
+    # signals v1, the driver flips to 1024 bytes for everything that follows
+    commander_core_device.device.firmware_version = (0x01, 0x02, 0x21)
+    commander_core_device.device.speeds = (None, 104, None, None, None, None, 918)
+    commander_core_device.device.led_counts = (27, None, 1, 2, 4, 8, 16)
+    commander_core_device.device.temperatures = (None, 45.6)
+    res = commander_core_device.initialize()
+
+    assert res[0][1] == '1.2.33'
+    assert commander_core_device._packet_length == 1024
+    assert commander_core_device.device._packet_length == 1024
+    assert not commander_core_device.device._awake
+
+
+def test_commander_core_v1_skips_continuation_reads(commander_core_device):
+    # firmware v1's 1024-byte reports always fit any payload in a single
+    # response, so the driver should not issue Read More or Read Final
+    commander_core_device.device.firmware_version = (0x01, 0x02, 0x21)
+    commander_core_device.device.speeds = (None, 104, None, None, None, None, 918)
+    commander_core_device.device.led_counts = (27, None, 1, 2, 4, 8, 16)
+    commander_core_device.device.temperatures = (None, 45.6)
+    commander_core_device.initialize()
+
+    subcommands = commander_core_device.device.read_subcommand_log
+    assert subcommands, 'driver did not issue any read commands'
+    assert all(sub == 0x01 for sub in subcommands), (
+        f'unexpected continuation read on Commander Core firmware v1: {subcommands}'
+    )
+
+
+def test_commander_core_xt_does_not_switch_to_v1_packets(commander_core_xt_device):
+    # only the original Commander Core (PID 0x0c1c) carries the v1/v2
+    # distinction; an XT firmware whose major happens to be 1 must stay
+    # at the 384-byte packet length
+    commander_core_xt_device.device.firmware_version = (0x01, 0x04, 0x3e)
+    commander_core_xt_device.device.speeds = (920, 904, None, None, None, None)
+    commander_core_xt_device.device.led_counts = (8, 8, None, None, None, None)
+    commander_core_xt_device.device.temperatures = (None, 32.1)
+    commander_core_xt_device.initialize()
+
+    assert commander_core_xt_device._packet_length == 384
