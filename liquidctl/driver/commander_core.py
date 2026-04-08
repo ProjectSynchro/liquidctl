@@ -297,10 +297,22 @@ class CommanderCore(UsbHidDriver):
         self._send_command(_CMD_OPEN_ENDPOINT, mode)
         raw_data = self._send_command(_CMD_READ_INITIAL)
 
-        if tuple(raw_data[3:5]) != data_type:
-            # close the endpoint before raising or the device gets stuck
-            self._send_command(_CMD_CLOSE_ENDPOINT)
-            raise ExpectationNotMet('device returned incorrect data type')
+        # Some Commander Core XT firmwares lie about the data type prefix
+        # after a HW_SPEED_MODE write: the body is the correct data for the
+        # endpoint we just opened, but the data type bytes come back as
+        # 0x0000 or even another endpoint's data type.  When the firmware
+        # is well-behaved, log a debug message; when it isn't, trust that
+        # the response is for the endpoint we just opened (it has to be:
+        # we issued an Open Endpoint immediately before this read) and
+        # carry on.
+        got_data_type = tuple(raw_data[3:5])
+        if got_data_type != data_type:
+            _LOGGER.debug(
+                'unexpected data type for endpoint %s: got %s, expected %s',
+                ':'.join(f'{b:02x}' for b in mode),
+                ':'.join(f'{b:02x}' for b in got_data_type),
+                ':'.join(f'{b:02x}' for b in data_type),
+            )
 
         # only chain Read More / Read Final when a single packet can't hold
         # the largest payload we might ask for; sending them on the XT (or

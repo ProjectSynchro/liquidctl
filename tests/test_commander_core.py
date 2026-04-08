@@ -50,6 +50,15 @@ class MockCommanderCoreDevice:
         self.fixed_speeds = (0, 0, 0, 0, 0, 0, 0)
         self.temperatures = (None, None)
         self.curve_points_by_device = [[],[],[],[],[],[],[]]
+        # mapping of (mode_lo, mode_hi) tuples to a (lo, hi) tuple that the
+        # Read Initial response should report as the data type prefix.
+        # Used to mimic real Commander Core XT firmwares that return the
+        # right body with the wrong data type bytes after a HW_SPEED_MODE
+        # write.
+        self.lie_data_type_for = {}
+        # if set, the next .write() call raises this exception.  used to
+        # exercise the wake/sleep cleanup paths in the driver.
+        self.raise_on_next_write = None
 
     def read(self, length):
         data = bytearray([0x00, self._last_write[2], 0x00])
@@ -133,6 +142,15 @@ class MockCommanderCoreDevice:
                         raise NotImplementedError(f'Read for {mode.hex(":")}')
                 else:
                     raise NotImplementedError(f'Read for {mode.hex(":")}')
+
+                # mimic the firmware quirk where some endpoints return the
+                # right body but with mislabeled data type bytes; the data
+                # type bytes live at offsets 3 and 4 of the response
+                lie = self.lie_data_type_for.get(tuple(mode))
+                if (lie is not None
+                        and self._last_write[2] == 0x08
+                        and self._last_write[4] == 0x01):
+                    data[3], data[4] = lie
             elif self._last_write[2] == 0x09:  # Get more data
                 channel = self._last_write[3]
                 mode = self._modes.get(channel)
@@ -157,6 +175,9 @@ class MockCommanderCoreDevice:
             raise ValueError(
                 f'host->device packet length {len(data)} does not match '
                 f'device report size {self._packet_length + 1}')
+        if self.raise_on_next_write is not None:
+            exc, self.raise_on_next_write = self.raise_on_next_write, None
+            raise exc
         self._last_write = data
         if data[0] != 0x00 or data[1] != 0x08:
             raise ValueError('Start of packets going out should be 00:08')
@@ -281,10 +302,13 @@ def test_initialize_commander_core(commander_core_device):
 
 
 def test_initialize_error_commander_core(commander_core_device):
-    """This tests sends invalid data to ensure the device gets set back to hardware mode on error"""
-    commander_core_device.device.response_prefix = (0x00, 0x00)
+    """An error mid-initialize must still leave the device in hardware mode."""
+    # let initialize get past the firmware query and into the wake context,
+    # then have the next write fail
+    commander_core_device.device.firmware_version = (0x02, 0x06, 0xc9)
+    commander_core_device.device.raise_on_next_write = OSError('synthetic')
 
-    with pytest.raises(ExpectationNotMet):
+    with pytest.raises(OSError):
         commander_core_device.initialize()
 
     # Ensure device is asleep at end
@@ -316,11 +340,11 @@ def test_status_commander_core(commander_core_device):
 
 
 def test_status_error_commander_core(commander_core_device):
-    """This tests sends invalid data to ensure the device gets set back to hardware mode on error"""
-    commander_core_device.device.response_prefix = (0x00, 0x00)
+    """An error mid-status must still leave the device in hardware mode."""
+    commander_core_device.device.raise_on_next_write = OSError('synthetic')
 
-    with pytest.raises(ExpectationNotMet):
-        commander_core_device.initialize()
+    with pytest.raises(OSError):
+        commander_core_device.get_status()
 
     # Ensure device is asleep at end
     assert not commander_core_device.device._awake
@@ -353,10 +377,10 @@ def test_set_fixed_speed_fans_commander_core(commander_core_device):
 
 
 def test_set_fixed_speed_error_commander_core(commander_core_device):
-    """This tests sends invalid data to ensure the device gets set back to hardware mode on error"""
-    commander_core_device.device.response_prefix = (0x00, 0x00)
+    """An error mid-set_fixed_speed must still leave the device in hardware mode."""
+    commander_core_device.device.raise_on_next_write = OSError('synthetic')
 
-    with pytest.raises(ExpectationNotMet):
+    with pytest.raises(OSError):
         commander_core_device.set_fixed_speed('fan1', 95)
 
     # Ensure device is asleep at end
@@ -690,3 +714,35 @@ def test_commander_core_xt_does_not_switch_to_v1_packets(commander_core_xt_devic
     commander_core_xt_device.initialize()
 
     assert commander_core_xt_device._packet_length == 384
+
+
+def test_read_data_accepts_lying_data_type_zero(commander_core_xt_device):
+    # some Commander Core XT firmwares return a zeroed data type prefix on
+    # HW_FIXED_PERCENT after iCUE has touched the endpoint; the body of
+    # the response is correct so the driver must accept it rather than
+    # raise ExpectationNotMet
+    commander_core_xt_device.device.firmware_version = (0x01, 0x04, 0x3e)
+    commander_core_xt_device.device.speeds_mode = (0, 0, 0, 0, 0, 0)
+    commander_core_xt_device.device.fixed_speeds = (40, 40, 40, 40, 40, 40)
+    commander_core_xt_device.device.lie_data_type_for = {(0x61, 0x6d): (0x00, 0x00)}
+
+    commander_core_xt_device.set_fixed_speed('fan4', 75)
+
+    assert commander_core_xt_device.device.fixed_speeds == (40, 40, 40, 75, 40, 40)
+    assert not commander_core_xt_device.device._awake
+
+
+def test_read_data_accepts_lying_data_type_other_endpoint(commander_core_xt_device):
+    # observed in the wild on a Core XT: after writing HW_SPEED_MODE the
+    # next read of HW_FIXED_PERCENT returns the correct body with the
+    # HW_CURVE_PERCENT data type prefix (0x05:0x00 instead of 0x04:0x00).
+    # the driver must trust the OPEN endpoint and accept the response
+    commander_core_xt_device.device.firmware_version = (0x01, 0x04, 0x3e)
+    commander_core_xt_device.device.speeds_mode = (0, 0, 0, 0, 0, 0)
+    commander_core_xt_device.device.fixed_speeds = (40, 40, 40, 40, 40, 40)
+    commander_core_xt_device.device.lie_data_type_for = {(0x61, 0x6d): (0x05, 0x00)}
+
+    commander_core_xt_device.set_fixed_speed('fan4', 75)
+
+    assert commander_core_xt_device.device.fixed_speeds == (40, 40, 40, 75, 40, 40)
+    assert not commander_core_xt_device.device._awake
